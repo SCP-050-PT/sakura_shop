@@ -1,10 +1,11 @@
 import asyncio
+import contextlib
 import logging
 import secrets
 
 from aiogram import Bot, F, Router, html
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import Command
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.callback_answer import CallbackAnswer
@@ -20,6 +21,7 @@ from app.bot.ui import render
 from app.db.models import Promo, SupportTicket, TicketStatus, User
 from app.money import fmt, parse_rub
 from app.services import shop
+from app.services.errors import ShopError
 from app.services.smm_api import SmmApiError, SmmPanelClient
 
 router = Router(name="admin_panel")
@@ -367,3 +369,83 @@ async def ticket_answer(message: Message, state: FSMContext, session: AsyncSessi
     except Exception:  # noqa: BLE001
         result = "⚠️ Ответ сохранён, но пользователь недоступен (заблокировал бота?)."
     await message.answer(result, reply_markup=back_kb("tickets"))
+
+
+# ---------------------------------------------------------------- orders on review / refunds
+
+
+@router.message(Command("review"))
+async def review_list(message: Message, session: AsyncSession) -> None:
+    orders = await shop.review_orders(session)
+    if not orders:
+        await message.answer("✅ Заказов на проверке нет.")
+        return
+    lines = [
+        f"#{o.id} · {html.quote(o.title)} × {o.quantity} · {fmt(o.amount)} · <code>{o.user_id}</code>\n"
+        f"   🔗 {html.quote(o.link or '—')} · {o.created_at:%d.%m %H:%M} UTC"
+        for o in orders[:30]
+    ]
+    await message.answer(
+        "<b>🔎 Заказы на проверке</b>\n\n" + "\n".join(lines) + "\n\n"
+        "<code>/order_attach ID ID_в_панели</code> — заказ есть в панели\n"
+        "<code>/order_refund ID</code> — заказа нет, вернуть деньги"
+    )
+
+
+@router.message(Command("order_refund"))
+async def order_refund(message: Message, command: CommandObject, session: AsyncSession, bot: Bot) -> None:
+    args = (command.args or "").split()
+    if len(args) != 1 or not args[0].isdigit():
+        await message.answer("Формат: <code>/order_refund ID_заказа</code>")
+        return
+    try:
+        order = await shop.resolve_review_refund(session, int(args[0]))
+    except ShopError as exc:
+        await message.answer(str(exc))
+        return
+    await message.answer(f"✅ Заказ #{order.id} отменён, {fmt(order.refunded)} возвращено пользователю.")
+    with contextlib.suppress(Exception):
+        await bot.send_message(
+            order.user_id, f"↩️ Заказ #{order.id} отменён. На баланс возвращено {fmt(order.refunded)}."
+        )
+
+
+@router.message(Command("order_attach"))
+async def order_attach(message: Message, command: CommandObject, session: AsyncSession) -> None:
+    args = (command.args or "").split()
+    if len(args) != 2 or not args[0].isdigit():
+        await message.answer("Формат: <code>/order_attach ID_заказа ID_в_панели</code>")
+        return
+    try:
+        order = await shop.resolve_review_attach(session, int(args[0]), args[1])
+    except ShopError as exc:
+        await message.answer(str(exc))
+        return
+    await message.answer(
+        f"✅ Заказ #{order.id} привязан к заказу панели {html.quote(args[1])}, статус будет отслеживаться."
+    )
+
+
+@router.message(Command("refund_stars"))
+async def refund_stars(message: Message, command: CommandObject, session: AsyncSession, bot: Bot) -> None:
+    args = (command.args or "").split()
+    if len(args) != 1 or not args[0].isdigit():
+        await message.answer("Формат: <code>/refund_stars ID_платежа</code> (номер счёта из логов пополнений)")
+        return
+    try:
+        payment = await shop.start_stars_refund(session, int(args[0]))
+    except ShopError as exc:
+        await message.answer(str(exc))
+        return
+    assert payment.external_id is not None
+    try:
+        await bot.refund_star_payment(user_id=payment.user_id, telegram_payment_charge_id=payment.external_id)
+    except TelegramAPIError as exc:
+        await session.rollback()
+        await message.answer(f"❗️ Telegram отклонил возврат: {html.quote(str(exc))}. Баланс не изменён.")
+        return
+    await session.commit()
+    await message.answer(
+        f"✅ Звёзды по платежу #{payment.id} возвращены, с баланса пользователя "
+        f"<code>{payment.user_id}</code> списано {fmt(payment.amount)}."
+    )

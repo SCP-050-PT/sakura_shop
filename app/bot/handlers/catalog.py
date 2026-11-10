@@ -8,17 +8,26 @@ from app.bot import keyboards as kb
 from app.bot.callbacks import BuyProductCb, BuyServiceCb, CatalogCb, CategoryCb, ServiceCb, SubcategoryCb
 from app.bot.handlers.delivery import deliver_order
 from app.bot.states import ProductStates, SmmStates
-from app.bot.ui import log_event, render
+from app.bot.ui import alert_admins, log_event, render, review_alert_text
 from app.config import Settings
-from app.db.models import Category, CategoryKind, SmmService, Subcategory, User
+from app.db.models import Category, CategoryKind, Order, SmmService, Subcategory, User
 from app.money import fmt, smm_cost
 from app.services import shop
-from app.services.errors import ShopError
+from app.services.errors import OrderNeedsReview, ShopError
 from app.services.smm_api import SmmPanelClient
 
 router = Router(name="catalog")
 
 KIND_TITLES = {CategoryKind.PRODUCT: "🛍 Товары", CategoryKind.SMM: "📈 Накрутка"}
+
+
+def product_text(sub: Subcategory, in_stock: int) -> str:
+    return (
+        f"<b>📦 {html.quote(sub.name)}</b>\n"
+        f"{sub.description}\n\n"
+        f"💳 Цена: <b>{fmt(sub.price)}</b> за 1 шт.\n"
+        f"♻️ В наличии: <b>{in_stock}</b> шт."
+    )
 
 
 @router.callback_query(CatalogCb.filter())
@@ -78,14 +87,7 @@ async def show_subcategory(
         )
         return
     count = await shop.stock_count(session, sub.id)
-    await render(
-        call,
-        f"<b>📦 {html.quote(sub.name)}</b>\n"
-        f"{sub.description}\n\n"
-        f"💳 Цена: <b>{fmt(sub.price)}</b> за 1 шт.\n"
-        f"♻️ В наличии: <b>{count}</b> шт.",
-        kb.product(sub, count),
-    )
+    await render(call, product_text(sub, count), kb.product(sub, count))
 
 
 # ---------------------------------------------------------------- products
@@ -251,6 +253,13 @@ async def smm_link(
     data = await state.get_data()
     try:
         order = await shop.buy_smm(session, smm, user.id, data["service_id"], data["quantity"], message.text)
+    except OrderNeedsReview as exc:
+        await state.clear()
+        await message.answer(str(exc), reply_markup=kb.back())
+        review = await session.get(Order, exc.order_id)
+        if review is not None:
+            await alert_admins(bot, settings, review_alert_text(review, "панель не ответила на создание заказа"))
+        return
     except ShopError as exc:
         await state.clear()
         await message.answer(str(exc), reply_markup=kb.back())

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -15,6 +15,11 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+def utcnow() -> datetime:
+    """Naive UTC, matching SQLite CURRENT_TIMESTAMP, so stored and compared times share one clock."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -37,12 +42,15 @@ class OrderStatus(StrEnum):
     COMPLETED = "completed"
     PARTIAL = "partial"
     FAILED = "failed"
+    # Panel outcome unknown (timeout or crash mid-order); money is held until an admin resolves it.
+    REVIEW = "review"
 
 
 class PaymentStatus(StrEnum):
     PENDING = "pending"
     PAID = "paid"
     EXPIRED = "expired"
+    REFUNDED = "refunded"
 
 
 class TicketStatus(StrEnum):
@@ -61,7 +69,7 @@ class User(Base):
     referral_earned: Mapped[int] = mapped_column(BigInteger, default=0)
     deposit_bonus_percent: Mapped[int] = mapped_column(Integer, default=0)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, server_default=func.now())
 
 
 class Category(Base):
@@ -135,7 +143,7 @@ class Order(Base):
     panel_status: Mapped[str | None] = mapped_column(String(32))
     # Copy of delivered stock so purchases stay viewable after stock is removed.
     delivered: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, server_default=func.now())
 
 
 class Payment(Base):
@@ -149,7 +157,7 @@ class Payment(Base):
     status: Mapped[str] = mapped_column(String(16), default=PaymentStatus.PENDING, index=True)
     external_id: Mapped[str | None] = mapped_column(String(128))
     pay_url: Mapped[str | None] = mapped_column(String(512))
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, server_default=func.now())
     paid_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
@@ -161,7 +169,7 @@ class Promo(Base):
     amount: Mapped[int] = mapped_column(BigInteger)
     max_activations: Mapped[int] = mapped_column(Integer, default=1)
     activations: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, server_default=func.now())
 
 
 class PromoActivation(Base):
@@ -182,4 +190,4 @@ class SupportTicket(Base):
     text: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), default=TicketStatus.OPEN, index=True)
     answer: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, server_default=func.now())

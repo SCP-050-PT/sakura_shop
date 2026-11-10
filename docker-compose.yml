@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    image: sakura-shop
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # SQLite database lives here and survives container rebuilds.
+      - ./data:/app/data

@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery, Chat, Message, PreCheckoutQuery, Succes
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.__main__ import build_dispatcher
-from app.bot.handlers import admin_catalog, admin_panel, catalog, common, deposit, profile, support
+from app.bot.handlers import admin_catalog, admin_panel, catalog, common, deposit, inline, profile, support
 from app.config import Settings
 from app.db import create_engine, create_sessionmaker, init_db
 
@@ -152,7 +152,7 @@ class Harness:
 def make_harness(settings: Settings, sessionmaker: async_sessionmaker[AsyncSession]):  # type: ignore[no-untyped-def]
     def factory(smm: Any = None, cryptobot: Any = None) -> Harness:
         # Module-level routers can belong to one parent only; each test builds a fresh Dispatcher.
-        for module in (admin_catalog, admin_panel, catalog, common, deposit, profile, support):
+        for module in (admin_catalog, admin_panel, catalog, common, deposit, inline, profile, support):
             module.router._parent_router = None  # noqa: SLF001
         session = MockSession()
         bot = Bot("42:TEST", session=session)

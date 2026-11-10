@@ -6,9 +6,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot import keyboards as kb
 from app.bot.callbacks import Nav
+from app.bot.handlers.catalog import product_text
+from app.bot.handlers.inline import parse_product_start
 from app.bot.ui import log_event, render, send_main_screen
 from app.config import Settings
-from app.db.models import User
+from app.db.models import Subcategory, User
 from app.money import fmt
 from app.services import shop
 
@@ -31,10 +33,14 @@ async def cmd_start(
     bot: Bot,
 ) -> None:
     await state.clear()
+    product_link = parse_product_start(command.args)
     if user_created:
         tg = message.from_user
         assert tg is not None
-        referrer_id = int(command.args) if command.args and command.args.isdigit() else None
+        if product_link:
+            referrer_id = product_link[1]
+        else:
+            referrer_id = int(command.args) if command.args and command.args.isdigit() else None
         if referrer_id and await shop.set_referrer(session, user, referrer_id):
             await session.commit()
             await bot.send_message(referrer_id, f"🎉 У вас новый реферал: {html.quote(tg.full_name)}")
@@ -45,6 +51,12 @@ async def cmd_start(
         )
     await message.answer(f"🌸 Добро пожаловать в <b>{html.quote(settings.shop_name)}</b>!", reply_markup=kb.reply_menu)
     await send_main_screen(bot, message.chat.id, settings, main_text(user), kb.main_menu(settings.is_admin(user.id)))
+    if product_link:
+        # Opened from a card shared in inline mode: jump straight to that product.
+        sub = await session.get(Subcategory, product_link[0])
+        if sub is not None:
+            count = await shop.stock_count(session, sub.id)
+            await message.answer(product_text(sub, count), reply_markup=kb.product(sub, count))
 
 
 @router.message(F.text == kb.MENU_BUTTON_TEXT)

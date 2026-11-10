@@ -2,15 +2,16 @@
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from aiogram import Bot
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot.handlers.deposit import notify_credit
+from app.bot.ui import alert_admins, review_alert_text
 from app.config import Settings
-from app.db.models import Order, OrderStatus, Payment, PaymentStatus, User
+from app.db.models import Order, OrderStatus, Payment, PaymentStatus, User, utcnow
 from app.money import fmt
 from app.services import shop
 from app.services.cryptobot import CryptoBotClient
@@ -20,6 +21,8 @@ log = logging.getLogger(__name__)
 
 PAYMENTS_INTERVAL = 30
 SMM_INTERVAL = 300
+# Far above the panel request timeout, so an order still being placed is never flagged.
+STUCK_ORDER_AFTER = timedelta(minutes=10)
 
 
 async def poll_cryptobot(
@@ -39,7 +42,7 @@ async def poll_cryptobot(
             return
         invoices = await client.get_invoices([int(p.external_id) for p in pending if p.external_id])
         # Small grace period: an invoice paid at the last second should still be picked up.
-        deadline = datetime.now() - timedelta(minutes=settings.invoice_ttl_minutes + 10)
+        deadline = utcnow() - timedelta(minutes=settings.invoice_ttl_minutes + 10)
         for payment in pending:
             invoice = invoices.get(int(payment.external_id or 0))
             if invoice is not None and invoice.status == "paid":
@@ -49,6 +52,13 @@ async def poll_cryptobot(
                     await notify_credit(bot, settings, result, user.username if user else None)
             elif (invoice is not None and invoice.status == "expired") or payment.created_at < deadline:
                 await shop.expire_payment(session, payment.id)
+
+
+async def flag_stuck_orders(sessionmaker: async_sessionmaker[AsyncSession], bot: Bot, settings: Settings) -> None:
+    async with sessionmaker() as session:
+        stuck = await shop.flag_stuck_smm_orders(session, STUCK_ORDER_AFTER)
+    for order in stuck:
+        await alert_admins(bot, settings, review_alert_text(order, "заказ списан, но не дошёл до панели"))
 
 
 async def poll_smm(sessionmaker: async_sessionmaker[AsyncSession], client: SmmPanelClient, bot: Bot) -> None:
@@ -84,6 +94,11 @@ async def run_background(
                 await poll_cryptobot(sessionmaker, cryptobot, bot, settings)
             except Exception:
                 log.exception("CryptoBot polling failed")
+        if ticks % (SMM_INTERVAL // PAYMENTS_INTERVAL) == 0:
+            try:
+                await flag_stuck_orders(sessionmaker, bot, settings)
+            except Exception:
+                log.exception("Stuck order check failed")
         if smm is not None and ticks % (SMM_INTERVAL // PAYMENTS_INTERVAL) == 0:
             try:
                 await poll_smm(sessionmaker, smm, bot)

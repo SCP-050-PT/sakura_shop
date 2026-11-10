@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import timedelta
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,18 +20,20 @@ from app.db.models import (
     SupportTicket,
     TicketStatus,
     User,
+    utcnow,
 )
 from app.money import smm_cost
 from app.services.errors import (
     InsufficientFunds,
     InvalidQuantity,
     NotFound,
+    OrderNeedsReview,
     OutOfStock,
     PromoError,
     ProviderError,
     ShopError,
 )
-from app.services.smm_api import SmmApiError, SmmPanelClient
+from app.services.smm_api import SmmApiError, SmmPanelClient, SmmTransportError
 
 # ---------------------------------------------------------------- users
 
@@ -193,6 +195,12 @@ async def buy_smm(
 
     try:
         order.panel_order_id = await api.add_order(service.panel_service_id, link, quantity)
+    except SmmTransportError:
+        # The panel may have accepted the order before the connection broke: refunding now
+        # could pay for a fulfilled order, retrying could duplicate it. Let an admin decide.
+        order.status = OrderStatus.REVIEW
+        await session.commit()
+        raise OrderNeedsReview(order.id) from None
     except SmmApiError:
         await change_balance(session, user_id, amount)
         order.status = OrderStatus.FAILED
@@ -248,6 +256,67 @@ async def user_orders(session: AsyncSession, user_id: int, limit: int = 10) -> l
     )
 
 
+async def flag_stuck_smm_orders(session: AsyncSession, older_than: timedelta) -> list[Order]:
+    """Move SMM orders that were charged but never reached the panel (e.g. bot crash) to REVIEW."""
+    cutoff = utcnow() - older_than
+    stuck = list(
+        await session.scalars(
+            select(Order).where(
+                Order.kind == CategoryKind.SMM,
+                Order.status == OrderStatus.PENDING,
+                Order.panel_order_id.is_(None),
+                Order.created_at < cutoff,
+            )
+        )
+    )
+    for order in stuck:
+        order.status = OrderStatus.REVIEW
+    await session.commit()
+    return stuck
+
+
+async def review_orders(session: AsyncSession) -> list[Order]:
+    return list(await session.scalars(select(Order).where(Order.status == OrderStatus.REVIEW).order_by(Order.id)))
+
+
+async def resolve_review_refund(session: AsyncSession, order_id: int) -> Order:
+    order = await session.get(Order, order_id)
+    if order is None:
+        raise NotFound()
+    claimed = await session.execute(
+        update(Order)
+        .where(Order.id == order_id, Order.status == OrderStatus.REVIEW)
+        .values(status=OrderStatus.FAILED, refunded=Order.amount)
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        await session.rollback()
+        raise ShopError("❗️ Заказ не на проверке.")
+    await change_balance(session, order.user_id, order.amount)
+    await session.commit()
+    await session.refresh(order)
+    return order
+
+
+async def resolve_review_attach(session: AsyncSession, order_id: int, panel_order_id: str) -> Order:
+    """The admin found the order in the panel: track it like any other processing order."""
+    order = await session.get(Order, order_id)
+    if order is None:
+        raise NotFound()
+    claimed = await session.execute(
+        update(Order)
+        .where(Order.id == order_id, Order.status == OrderStatus.REVIEW)
+        .values(status=OrderStatus.PROCESSING, panel_order_id=panel_order_id)
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        await session.rollback()
+        raise ShopError("❗️ Заказ не на проверке.")
+    await session.commit()
+    await session.refresh(order)
+    return order
+
+
 # ---------------------------------------------------------------- payments
 
 
@@ -271,7 +340,7 @@ async def complete_payment(
     session: AsyncSession, payment_id: int, referral_percent: int, external_id: str | None = None
 ) -> CreditResult | None:
     """Credit a pending payment. Returns None if it was already processed (idempotent)."""
-    values: dict[str, object] = {"status": PaymentStatus.PAID, "paid_at": datetime.now()}
+    values: dict[str, object] = {"status": PaymentStatus.PAID, "paid_at": utcnow()}
     if external_id is not None:
         values["external_id"] = external_id
     claimed = await session.execute(
@@ -317,6 +386,59 @@ async def expire_payment(session: AsyncSession, payment_id: int) -> None:
         .execution_options(synchronize_session=False)
     )
     await session.commit()
+
+
+async def start_stars_refund(session: AsyncSession, payment_id: int) -> Payment:
+    """Mark a Stars payment refunded and take the deposit back, WITHOUT committing.
+
+    The caller commits only after Telegram confirms refundStarPayment, so a failed
+    API call rolls everything back.
+    """
+    payment = await session.get(Payment, payment_id)
+    if payment is None:
+        raise NotFound()
+    if payment.provider != "stars" or not payment.external_id:
+        raise ShopError("❗️ Вернуть можно только оплату звёздами.")
+    claimed = await session.execute(
+        update(Payment)
+        .where(Payment.id == payment_id, Payment.status == PaymentStatus.PAID)
+        .values(status=PaymentStatus.REFUNDED)
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        await session.rollback()
+        raise ShopError("❗️ Платёж не в статусе «оплачен».")
+    if not await change_balance(session, payment.user_id, -payment.amount):
+        await session.rollback()
+        raise InsufficientFunds()
+    await session.execute(
+        update(User)
+        .where(User.id == payment.user_id)
+        .values(total_deposited=User.total_deposited - payment.amount)
+        .execution_options(synchronize_session=False)
+    )
+    return payment
+
+
+# ---------------------------------------------------------------- inline search
+
+
+async def search_products(session: AsyncSession, query: str, limit: int = 50) -> list[tuple[Subcategory, int]]:
+    """In-stock products whose name or category matches the query, with stock counts."""
+    stock = select(StockItem.subcategory_id, func.count().label("n")).group_by(StockItem.subcategory_id).subquery()
+    rows = (
+        await session.execute(
+            select(Subcategory, Category.name, stock.c.n)
+            .join(Category, Category.id == Subcategory.category_id)
+            .join(stock, stock.c.subcategory_id == Subcategory.id)
+            .where(Category.kind == CategoryKind.PRODUCT)
+            .order_by(Subcategory.id)
+        )
+    ).all()
+    # Filtered in Python: SQLite LIKE/lower() are ASCII-only and would miss Cyrillic case.
+    needle = query.strip().casefold()
+    found = [(sub, n) for sub, cat_name, n in rows if needle in f"{cat_name} {sub.name}".casefold()]
+    return found[:limit]
 
 
 # ---------------------------------------------------------------- promo

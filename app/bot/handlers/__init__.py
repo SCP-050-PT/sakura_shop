@@ -1,6 +1,6 @@
 from aiogram import Router
 
-from app.bot.handlers import admin_catalog, admin_panel, catalog, common, deposit, profile, support
+from app.bot.handlers import admin_catalog, admin_panel, catalog, common, deposit, inline, profile, support
 
 
 def setup_routers() -> Router:
@@ -15,5 +15,6 @@ def setup_routers() -> Router:
         profile.router,
         deposit.router,
         support.router,
+        inline.router,
     )
     return root

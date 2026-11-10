@@ -16,7 +16,7 @@ from app.background import run_background
 from app.bot.handlers import setup_routers
 from app.bot.middlewares import DbSessionMiddleware, ThrottlingMiddleware
 from app.config import Settings
-from app.db import create_engine, create_sessionmaker, init_db
+from app.db import create_engine, create_sessionmaker, migrate
 from app.services.cryptobot import CryptoBotClient
 from app.services.smm_api import SmmPanelClient
 
@@ -45,7 +45,7 @@ async def main() -> None:
     )
     settings = Settings()  # type: ignore[call-arg]
     engine = create_engine(settings.database_url)
-    await init_db(engine)
+    await migrate(engine, settings.database_url)
     sessionmaker = create_sessionmaker(engine)
 
     smm = (
