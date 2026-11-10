@@ -1,11 +1,13 @@
 from contextlib import suppress
 from pathlib import Path
 
-from aiogram import Bot
+from aiogram import Bot, html
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Message
 
 from app.config import Settings
+from app.db.models import Order
+from app.money import fmt
 
 CAPTION_LIMIT = 1024
 
@@ -48,3 +50,22 @@ async def log_event(bot: Bot, settings: Settings, text: str) -> None:
         return
     with suppress(Exception):
         await bot.send_message(settings.log_chat_id, text)
+
+
+async def alert_admins(bot: Bot, settings: Settings, text: str) -> None:
+    """For events that need an admin's action: DM every admin and mirror to the log chat."""
+    for admin_id in settings.admin_ids:
+        with suppress(Exception):
+            await bot.send_message(admin_id, text)
+    await log_event(bot, settings, text)
+
+
+def review_alert_text(order: Order, reason: str) -> str:
+    return (
+        f"⚠️ <b>Заказ #{order.id} требует проверки</b>: {reason}.\n"
+        f"{html.quote(order.title)} × {order.quantity} = {fmt(order.amount)}\n"
+        f"🔗 {html.quote(order.link or '—')}\nПользователь: <code>{order.user_id}</code>\n\n"
+        "Найдите заказ в SMM-панели по ссылке и времени, затем:\n"
+        f"• нашли — <code>/order_attach {order.id} ID_в_панели</code>\n"
+        f"• не нашли — <code>/order_refund {order.id}</code>"
+    )

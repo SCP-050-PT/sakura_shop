@@ -10,6 +10,10 @@ class SmmApiError(Exception):
     pass
 
 
+class SmmTransportError(SmmApiError):
+    """No usable answer from the panel: the request may or may not have been executed."""
+
+
 @dataclass(slots=True)
 class SmmOrderStatus:
     status: str
@@ -32,7 +36,7 @@ class SmmPanelClient:
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise SmmApiError(f"SMM panel request failed: {exc}") from exc
+            raise SmmTransportError(f"SMM panel request failed: {exc}") from exc
         if isinstance(payload, dict) and payload.get("error"):
             raise SmmApiError(str(payload["error"]))
         return payload
