@@ -1,4 +1,5 @@
-environs
-aiosqlite
-requests
-aiogram
+aiogram==3.31.0
+SQLAlchemy[asyncio]==2.1.8
+aiosqlite==0.22.1
+pydantic-settings==2.16.2
+httpx==0.28.1
